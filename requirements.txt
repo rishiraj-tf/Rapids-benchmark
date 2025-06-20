@@ -1,0 +1,15 @@
+# Tell pip to pull GPU-accelerated wheels from NVIDIA’s index
+--extra-index-url=https://pypi.nvidia.com
+cudf-cu12==25.6.*
+cuml-cu12==25.6.*
+
+# Dask for parallelism
+dask-ml
+dask[distributed]
+dask-cuda
+
+xgboost
+numpy
+pandas
+scikit-learn
+matplotlib
