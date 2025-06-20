@@ -4,7 +4,7 @@ import cudf
 
 # ——— CONFIG ———————————————————————————————————————————————————
 # Path to the downloaded 1brc dataset CSV
-DATA_FILE = "../data/20210830-WeatherData.csv"
+DATA_FILE = "data/20210830-WeatherData.csv"
 
 # Column that holds the date (or station/day grouping key)
 DATE_COL = "Date"
