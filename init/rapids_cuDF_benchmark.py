@@ -1,70 +1,92 @@
+
+"""
+Multi-GPU Pandas vs cuDF Benchmark on ~115M Rows (NYC Yellow Taxi)
+-----------------------------------------------------------------
+* Downloads 5 months of Yellow Taxi Parquet (~115M rows total) if missing
+* Spins up a LocalCUDACluster across all GPUs
+* Compares Pandas (CPU) vs Dask-cuDF (multi-GPU) for daily mean total_fare → max
+"""
+import os
 import time
+import glob
+import urllib.request
+from pathlib import Path
+
 import pandas as pd
 import cudf
+import dask_cudf
+from dask.distributed import Client
+from dask_cuda import LocalCUDACluster
 
-# ——— CONFIG ———————————————————————————————————————————————————
-# Path to the downloaded 1brc dataset CSV
-DATA_FILE = "data/20210830-WeatherData.csv"
+# ── CONFIG ─────────────────────────────────────────────
+MONTHS     = ["2023-01","2023-02","2023-03","2023-04","2023-05"]  # 5 months ≈ 115M rows
+data_dir   = Path("data")
+REPEATS    = 3
+TS_COL     = "tpep_pickup_datetime"
+VAL_COL    = "total_amount"
+BASE_URL   = "https://d37ci6vzurychx.cloudfront.net/trip-data/"
+# ───────────────────────────────────────────────────────
 
-# Column that holds the date (or station/day grouping key)
-DATE_COL = "Date"
+def ensure_data():
+    data_dir.mkdir(exist_ok=True)
+    files = []
+    for m in MONTHS:
+        fname = f"yellow_tripdata_{m}.parquet"
+        path = data_dir / fname
+        if not path.exists():
+            url = BASE_URL + fname
+            print(f"Downloading {url} ...")
+            urllib.request.urlretrieve(url, path)
+            print(f"Saved to {path}")
+        files.append(str(path))
+    return files
 
-# Column that holds the daily mean temperature
-# (in the 1brc CSV this is called something like "MeanTemp" or "TAVG" – check your header)
-TEMP_COL = "MeanTemp"
+# CPU path: load + prepare + aggregate
+def pandas_workflow(files):
+    # load all into one DataFrame
+    dfs = [pd.read_parquet(f) for f in files]
+    pdf = pd.concat(dfs, ignore_index=True)
+    pdf["day"] = pd.to_datetime(pdf[TS_COL]).dt.date
+    # group & aggregate
+    return pdf.groupby("day")[VAL_COL].mean().max()
 
-# Number of times to repeat the group+agg to smooth out noise
-REPEATS = 3
-# ——————————————————————————————————————————————————————————
+# GPU path: Dask-cuDF multi-GPU
+def cudf_workflow(files):
+    cluster = LocalCUDACluster()
+    client = Client(cluster)
+    n_gpus = len(client.ncores())
+    print(f"Using {n_gpus} GPU(s) for Dask-cuDF")
 
+    ddf = dask_cudf.read_parquet(files)
+    ddf["day"] = ddf[TS_COL].dt.date
+    max_series = ddf.groupby("day")[VAL_COL].mean()
+    result = max_series.max().compute()
+
+    client.close(); cluster.close()
+    return result
+
+# Utility timer
 def timeit(func, *args, **kwargs):
     t0 = time.time()
-    result = func(*args, **kwargs)
-    return result, time.time() - t0
+    out = func(*args, **kwargs)
+    return out, time.time() - t0
 
-def pandas_max_mean_temp(df):
-    # group by DATE_COL, compute avg of TEMP_COL, then take the overall max
-    return df.groupby(DATE_COL)[TEMP_COL].mean().max()
+# Main benchmark
+def main():
+    files, _ = timeit(lambda: ensure_data())
+    print(f"\nFiles ready: {len(files)} months → ~{len(files)*23}M rows\n{'-'*60}")
 
-def cudf_max_mean_temp(df):
-    # same in cuDF
-    return df.groupby(DATE_COL)[TEMP_COL].mean().max().item()
+    # Pandas
+    print("→ pandas (CPU)")
+    _, t_load = timeit(pandas_workflow, files)
+    print(f"  full load+agg: {t_load:.2f}s")
 
-def benchmark():
-    print(f"\nLoading & computing on {DATA_FILE!r}\n" + "-"*60)
-    # pandas
-    print("→ pandas:")
-    df_pd, t_load_pd = timeit(pd.read_csv, DATA_FILE)
-    print(f"   load: {t_load_pd:.2f}s")
+    # Dask-cuDF
+    print("\n→ Dask-cuDF (multi-GPU)")
+    _, t_gpu = timeit(cudf_workflow, files)
+    print(f"  full load+agg: {t_gpu:.2f}s")
 
-    # warm-up / repeat the group-by a few times
-    t_agg_pd = 0.0
-    max_mean_pd = None
-    for _ in range(REPEATS):
-        val, dt = timeit(pandas_max_mean_temp, df_pd)
-        t_agg_pd += dt
-        max_mean_pd = val
-    t_agg_pd /= REPEATS
-    print(f"   avg(group→max)  over {REPEATS} runs: {t_agg_pd:.2f}s → max_mean={max_mean_pd:.2f}")
-
-    # cuDF
-    print("\n→ cuDF (GPU):")
-    df_gpu, t_load_gpu = timeit(cudf.read_csv, DATA_FILE)
-    print(f"   load: {t_load_gpu:.2f}s")
-
-    t_agg_gpu = 0.0
-    max_mean_gpu = None
-    for _ in range(REPEATS):
-        val, dt = timeit(cudf_max_mean_temp, df_gpu)
-        t_agg_gpu += dt
-        max_mean_gpu = val
-    t_agg_gpu /= REPEATS
-    print(f"   avg(group→max)  over {REPEATS} runs: {t_agg_gpu:.2f}s → max_mean={max_mean_gpu:.2f}")
-
-    # speedups
-    print("\nSpeedups:")
-    print(f"  load speedup : {t_load_pd / t_load_gpu:.1f}×")
-    print(f"  agg speedup  : {t_agg_pd  / t_agg_gpu:.1f}×")
+    print("\nSpeed-up (CPU ÷ GPU):", f"{t_load/t_gpu:.2f}×")
 
 if __name__ == "__main__":
-    benchmark()
+    main()
